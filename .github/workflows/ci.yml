@@ -1,0 +1,171 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    outputs:
+      # Used in the release job and set in "project_info" step
+      project_name: ${{ steps.project_info.outputs.name }}
+      project_version: ${{ steps.project_info.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        id: install_dependencies
+        run: |
+          sudo apt-get update
+
+          # Install LLVM/Clang 17 and Meson
+          sudo apt-get install -y \
+            ninja-build \
+            meson \
+            python3-pip \
+            clang-17 \
+            libclang-17-dev \
+            llvm-17-dev \
+            pkg-config \
+            jq
+
+          # Ensure the clang 17 binaries are used
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-17 170
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-17 170
+          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-17 170
+
+          # Ensure we are using the correct versions
+          clang --version
+          llvm-config --version
+
+          # Get location of libLLVM-17.so.1
+          libllvm17_path=$(llvm-config --libdir)/libLLVM-17.so.1
+
+          # Ensure libLLVM-17.so.1 exists
+          if [ ! -f "$libllvm17_path" ]; then
+            echo "Error: $libllvm17_path does not exist."
+            exit 1
+          fi
+
+          # Get the absolute path of libLLVM-17.so.1 if it's a symlink
+          if [ -L "$libllvm17_path" ]; then
+            libllvm17_path=$(readlink -f "$libllvm17_path")
+            echo "Resolved libLLVM-17.so.1 path: $libllvm17_path"
+          fi
+
+          # Verify that libLLVM-17.so.1 is a shared library
+          file "$libllvm17_path" | grep "shared object" || { echo "Error: $libllvm17_path is not a shared library."; exit 1; }
+
+          # Print libLLVM-17.so.1 path for debugging and export it for later use
+          echo "libLLVM-17.so.1 path: $libllvm17_path"
+          echo "libllvm17_path=$libllvm17_path" >> $GITHUB_OUTPUT
+
+      - name: Configure build
+        run: |
+          # Since we will be distributing libLLVM-17.so.1 with our binaries,
+          # we set the rpath to $ORIGIN so that the binary looks for the shared
+          # library in its own directory at runtime.
+          export CFLAGS="-Wl,-rpath,\$ORIGIN"
+          export CXXFLAGS="-Wl,-rpath,\$ORIGIN"
+          export LDFLAGS="-Wl,-rpath,\$ORIGIN"
+
+          meson setup build --buildtype=release
+
+      - name: Compile
+        run: meson compile -C build
+
+      - name: Get project name and version
+        if: github.ref == 'refs/heads/master'
+        id: project_info
+        run: |
+          info=$(meson introspect build --projectinfo)
+          name=$(echo "$info" | jq -r .descriptive_name)
+          version=$(echo "$info" | jq -r .version)
+          echo "name=$name" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Install into staging directory
+        if: github.ref == 'refs/heads/master'
+        run: |
+          # Create the final dist folder, it will contain the tarballs we release
+          mkdir -p dist
+
+          # The name of the folder and tarball, e.g. hdoc-1.0.0-linux-x86_64.tar.gz
+          FOLDR_NAME="${{ steps.project_info.outputs.name }}-${{ steps.project_info.outputs.version }}"
+          TAR_NAME="${FOLDR_NAME}-linux-x86_64.tar.gz"
+
+          # Install into a temporary directory - installs into build/install-root
+          DESTDIR=install-root meson install -C build
+
+          # Directory which contains all files to be packaged
+          mkdir -p package-root/$FOLDR_NAME
+
+          # Copy binaries to the package root
+          cp build/install-root/usr/local/bin/* package-root/$FOLDR_NAME/
+
+          # Copy libLLVM-17.so.1 to the package root
+          cp "${{ steps.install_dependencies.outputs.libllvm17_path }}" package-root/$FOLDR_NAME/
+
+          # Copy Readme and License
+          cp README.md package-root/$FOLDR_NAME/
+          cp LICENSE package-root/$FOLDR_NAME/
+
+          # Finally, create the tarball
+          tar -C package-root -czf dist/$TAR_NAME .
+
+      - name: Upload build artifacts
+        if: github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-artifacts
+          path: dist
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository for tagging
+        uses: actions/checkout@v4
+
+      - name: Create Git tag for release
+        id: create_tag
+        run: |
+          VERSION="${{ needs.build.outputs.project_version }}"
+          TAG_NAME="v$VERSION"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Tag $TAG_NAME already exists"
+          else
+            git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+            git push origin "$TAG_NAME"
+          fi
+
+          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: built-artifacts
+          path: ./dist/
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.create_tag.outputs.tag }}
+          name: ${{ needs.build.outputs.project_name }} ${{ needs.build.outputs.project_version }}
+          files: ./dist/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
